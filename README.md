@@ -1,7 +1,7 @@
 # libddcci
 
-# THIS LIBRARY IS FULLY WRITTEN BY GROK BUILD
-## I AM NEVER AGAIN TRYING TO WRITE A DDC/CI LIBRARY AS IT WAS PAINFUL LAST TIME I TRIED SO THIS SHOULD BE ENOUGH
+![Static Badge](https://img.shields.io/badge/Vibecoded-Grok-black?style=for-the-badge&labelColor=%236F0E82)
+
 
 A small C library for talking to monitors over **DDC/CI** on Linux I2C
 (`/dev/i2c-*`). It can:
