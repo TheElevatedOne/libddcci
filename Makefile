@@ -22,7 +22,7 @@ BINDIR       ?= $(PREFIX)/bin
 PKGCONFIGDIR ?= $(LIBDIR)/pkgconfig
 DESTDIR      ?=
 
-VERSION := 1.1.0
+VERSION := 0.2.0
 SOMAJOR := 1
 
 CC      ?= gcc
