@@ -303,6 +303,170 @@ static void test_null_args(void)
     EXPECT_EQ_U(ddcci_parse_capabilities(NULL, NULL), DDCCI_ERR_INVALID_ARG, "caps null");
     EXPECT_EQ_U(ddcci_find_displays(NULL, NULL), DDCCI_ERR_INVALID_ARG, "find null");
     EXPECT_EQ_U(ddcci_open(-1, NULL), DDCCI_ERR_INVALID_ARG, "open null");
+    EXPECT_EQ_U(ddcci_save_settings(NULL), DDCCI_ERR_INVALID_ARG, "save null");
+    EXPECT_EQ_U(ddcci_set_vcp(NULL, 0x10, 1), DDCCI_ERR_INVALID_ARG, "set null");
+    ddcci_set_sleep_scale(NULL, 0.25);
+    ddcci_close(NULL);
+    ddcci_free_info_list(NULL);
+}
+
+static void test_null_message_and_padding(void)
+{
+    uint8_t null_frame[8] = {0x6E, 0x80, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t padded[16] = {
+        0x6E, 0x88, 0x02, 0x00, 0x10, 0x00, 0x00, 0x64, 0x00, 0x2D, 0xED,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+    };
+    uint8_t no_flag[11] = {
+        0x6E, 0x08, 0x02, 0x00, 0x10, 0x00, 0x00, 0x64, 0x00, 0x2D, 0x00
+    };
+    ddcci_feature f;
+    size_t flen = 0;
+    bool is_null = false;
+
+    null_frame[2] = ddcci_xor(DDCCI_HOST_XOR, null_frame, 2);
+    EXPECT(ddcci_frame_split(null_frame, sizeof(null_frame), &flen, &is_null),
+           "null frame splits");
+    EXPECT(is_null, "null flag");
+    EXPECT_EQ_U(flen, 3, "null length");
+    /* A null message means "not ready", not "this VCP does not exist". */
+    EXPECT_EQ_U(ddcci_unpack_getvcp(null_frame, sizeof(null_frame), 0x10, &f),
+                DDCCI_ERR_TIMEOUT, "null is not unsupported");
+    EXPECT(!f.present, "null feature stays clear");
+
+    flen = 0;
+    is_null = true;
+    EXPECT(ddcci_frame_split(padded, sizeof(padded), &flen, &is_null), "padded split");
+    EXPECT(!is_null, "padded is not null");
+    EXPECT_EQ_U(flen, 11, "padded trimmed");
+    EXPECT_EQ_U(ddcci_unpack_getvcp(padded, sizeof(padded), 0x10, &f),
+                DDCCI_OK, "padded unpack");
+    EXPECT_EQ_U(f.current, 45, "padded current");
+    EXPECT_EQ_U(f.maximum, 100, "padded max");
+
+    no_flag[10] = ddcci_xor(DDCCI_HOST_XOR, no_flag, 10);
+    EXPECT(!ddcci_frame_split(no_flag, sizeof(no_flag), &flen, &is_null),
+           "length flag required");
+    EXPECT_EQ_U(ddcci_unpack_getvcp(no_flag, sizeof(no_flag), 0x10, &f),
+                DDCCI_ERR_PARSE, "missing length flag");
+}
+
+static void test_caps_append_stops_at_nul(void)
+{
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    bool done = false;
+    const uint8_t frag[] = {'a', 'b', 'c', 0, 'X', 'Y', 'Z'};
+
+    EXPECT_EQ_U(ddcci_caps_append(&buf, &len, &cap, frag, sizeof(frag), &done),
+                DDCCI_OK, "append");
+    EXPECT(done, "saw nul");
+    EXPECT_EQ_U(len, 3, "stopped before garbage");
+    EXPECT(buf && strcmp(buf, "abc") == 0, "abc only");
+    free(buf);
+
+    buf = NULL;
+    len = 0;
+    cap = 0;
+    done = true;
+    EXPECT_EQ_U(ddcci_caps_append(&buf, &len, &cap, (const uint8_t *)"hello", 5, &done),
+                DDCCI_OK, "append hello");
+    EXPECT(!done, "no nul yet");
+    EXPECT_EQ_U(ddcci_caps_append(&buf, &len, &cap, (const uint8_t *)"!\0", 2, &done),
+                DDCCI_OK, "append bang");
+    EXPECT(done && buf && strcmp(buf, "hello!") == 0, "joined");
+    free(buf);
+}
+
+static void test_caps_case_and_probe_fields(void)
+{
+    ddcci_info info;
+
+    ddcci_info_reset(&info);
+    info.brightness.opcode = 0x10;
+    info.brightness.current = 40;
+    info.brightness.maximum = 100;
+    info.brightness.from_probe = true;
+    info.brightness.present = true;
+    info.mccs_major = 2;
+    info.mccs_minor = 4;
+
+    EXPECT_EQ_U(ddcci_parse_capabilities("(vcp(12)mccs_ver(3.0))", &info),
+                DDCCI_OK, "parse keeps probe");
+    EXPECT_EQ_U(info.brightness.opcode, 0x10, "opcode kept");
+    EXPECT_EQ_U(info.brightness.current, 40, "current kept");
+    EXPECT_EQ_U(info.brightness.maximum, 100, "max kept");
+    EXPECT(info.brightness.from_probe, "from_probe kept");
+    EXPECT(!info.brightness.from_caps, "0x10 is not in this string");
+    EXPECT(info.contrast.present && info.contrast.opcode == 0x12, "contrast from caps");
+    EXPECT(info.contrast.from_caps && !info.contrast.from_probe, "contrast caps only");
+    EXPECT_EQ_U(info.mccs_major, 3, "string replaces mccs");
+    EXPECT_EQ_U(info.mccs_minor, 0, "mccs minor from string");
+    EXPECT(!ddcci_info_has_vcp(&info, 0x10), "list replaced");
+    EXPECT(ddcci_info_has_vcp(&info, 0x12), "12 listed");
+
+    ddcci_info_reset(&info);
+    info.brightness.opcode = 0x10;
+    info.brightness.current = 7;
+    info.brightness.from_probe = true;
+    info.brightness.present = true;
+    EXPECT_EQ_U(ddcci_parse_capabilities("(VCP(10 12)MCCS_VER(2.2))", &info),
+                DDCCI_OK, "case insensitive tags");
+    EXPECT(info.brightness.from_caps && info.brightness.from_probe, "both sources");
+    EXPECT_EQ_U(info.brightness.current, 7, "current still kept");
+    EXPECT(info.contrast.present && info.contrast.opcode == 0x12, "contrast 12");
+    EXPECT_EQ_U(info.mccs_major, 2, "mccs 2");
+    EXPECT_EQ_U(info.mccs_minor, 2, "mccs .2");
+}
+
+static void edid_fix_checksum(uint8_t *edid)
+{
+    unsigned sum = 0;
+    int i;
+
+    edid[127] = 0;
+    for (i = 0; i < 127; i++)
+        sum += edid[i];
+    edid[127] = (uint8_t)((256u - (sum & 0xFFu)) & 0xFFu);
+}
+
+static void test_edid_text_and_mfg(void)
+{
+    uint8_t raw[128];
+    ddcci_edid e;
+    size_t nlen;
+
+    make_edid(raw, "DEL", "U2720Q", "ABCDEF");
+    nlen = strlen("U2720Q");
+    raw[54 + 5 + nlen] = 0x00;
+    raw[54 + 5 + nlen + 1] = 'X';
+    raw[54 + 5 + nlen + 2] = 'X';
+    edid_fix_checksum(raw);
+    EXPECT_EQ_U(ddcci_parse_edid(raw, 128, &e), DDCCI_OK, "nul name parses");
+    EXPECT(strcmp(e.model, "U2720Q") == 0, "nul stops the name");
+
+    make_edid(raw, "DEL", "U2720Q", "ABCDEF");
+    raw[54 + 3] = 0xFE;
+    edid_fix_checksum(raw);
+    EXPECT_EQ_U(ddcci_parse_edid(raw, 128, &e), DDCCI_OK, "fe parses");
+    EXPECT(strcmp(e.model, "U2720Q") == 0, "0xFE used when no name descriptor");
+
+    make_edid(raw, "DEL", "U2720Q", "ABCDEF");
+    raw[54 + 3] = 0xFE;
+    raw[90] = raw[91] = raw[92] = raw[94] = 0;
+    raw[93] = 0xFC;
+    memcpy(raw + 95, "FC-MODEL", 8);
+    raw[95 + 8] = 0x0A;
+    edid_fix_checksum(raw);
+    EXPECT_EQ_U(ddcci_parse_edid(raw, 128, &e), DDCCI_OK, "fc overrides fe");
+    EXPECT(strcmp(e.model, "FC-MODEL") == 0, "monitor name wins");
+
+    make_edid(raw, "DEL", "U2720Q", "ABCDEF");
+    raw[8] = 0;
+    raw[9] = 0;
+    edid_fix_checksum(raw);
+    EXPECT_EQ_U(ddcci_parse_edid(raw, 128, &e), DDCCI_OK, "bad mfg still parses");
+    EXPECT(strcmp(e.manufacturer, "???") == 0, "invalid PNP letters");
 }
 
 int main(void)
@@ -323,6 +487,10 @@ int main(void)
     test_edid_bad_header();
     test_edid_short();
     test_null_args();
+    test_null_message_and_padding();
+    test_caps_append_stops_at_nul();
+    test_caps_case_and_probe_fields();
+    test_edid_text_and_mfg();
 
     printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed ? 1 : 0;

@@ -1,0 +1,28 @@
+DDCCI_1.0 {
+    global:
+        ddcci_find_displays;
+        ddcci_free_info_list;
+        ddcci_info_has_vcp;
+        ddcci_open;
+        ddcci_open_path;
+        ddcci_open_connector;
+        ddcci_close;
+        ddcci_query;
+        ddcci_has_ddc;
+        ddcci_find_brightness;
+        ddcci_find_contrast;
+        ddcci_get_vcp;
+        ddcci_set_vcp;
+        ddcci_get_capabilities;
+        ddcci_parse_edid;
+        ddcci_parse_capabilities;
+        ddcci_strerror;
+    local:
+        *;
+};
+
+DDCCI_1.1 {
+    global:
+        ddcci_save_settings;
+        ddcci_set_sleep_scale;
+} DDCCI_1.0;
