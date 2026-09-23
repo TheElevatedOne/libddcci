@@ -126,8 +126,24 @@ ddcci_status_t ddcci_read_edid_i2c(struct ddcci_display *d, ddcci_edid *out);
 
 int  ddcci_bus_from_devnode(const char *path);
 void ddcci_note_identity(struct ddcci_display *d);
-/* Match a DRM short or full name. Writes the short name. Returns the bus or -1. */
+/* Match a DRM short or full name. Writes the short name. Returns the bus or -1.
+ * The number in "DP-3" is not an I2C bus. When the connector names two
+ * adapters, the one that carries this link's DDC/CI is returned. */
 int  ddcci_bus_from_connector(const char *drm_connector, char *short_name, size_t short_n);
+
+/* Last "i2c-<number>" in s, or -1. */
+int  ddcci_i2c_number_in(const char *s);
+
+/* ddc_bus is the "ddc" symlink. child_bus is an "i2c-*" entry in the
+ * connector directory. Either may be -1; names may be NULL.
+ * DisplayPort, eDP, and USB-C try the AUX adapter first — on amdgpu the
+ * symlink points at the non-AUX hw bus, which does not speak DDC/CI for a
+ * native DP link. HDMI, DVI, and VGA try the symlink first.
+ * *secondary is -1 when there is no other adapter to try. */
+void ddcci_order_connector_buses(const char *connector,
+                                 int ddc_bus, const char *ddc_name,
+                                 int child_bus, const char *child_name,
+                                 int *primary, int *secondary);
 
 ddcci_status_t ddcci_get_vcp_raw(struct ddcci_display *d, uint8_t opcode,
                                  ddcci_feature *out);

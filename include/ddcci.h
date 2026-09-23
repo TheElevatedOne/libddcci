@@ -29,10 +29,10 @@ extern "C" {
 #pragma GCC visibility push(default)
 #endif
 
-#define DDCCI_VERSION_MAJOR 1
-#define DDCCI_VERSION_MINOR 1
+#define DDCCI_VERSION_MAJOR 0
+#define DDCCI_VERSION_MINOR 3
 #define DDCCI_VERSION_PATCH 0
-#define DDCCI_VERSION_STRING "0.2.0"
+#define DDCCI_VERSION_STRING "0.3.0"
 
 /* 7-bit I2C slave addresses */
 #define DDCCI_ADDR_DDC 0x37u
@@ -131,7 +131,8 @@ ddcci_status_t ddcci_open(int bus, ddcci_display **out);
 ddcci_status_t ddcci_open_path(const char *dev_path, ddcci_display **out);
 
 /* drm_connector is a DRM name ("DP-1", "HDMI-A-1") or a full sysfs name
- * ("card0-DP-1"). Does not probe other displays. */
+ * ("card0-DP-1"). The number in "DP-3" is the connector on the card, not an
+ * I2C bus. Does not probe other displays. */
 ddcci_status_t ddcci_open_connector(const char *drm_connector,
                                     ddcci_display **out);
 void ddcci_close(ddcci_display *d);

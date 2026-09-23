@@ -469,6 +469,72 @@ static void test_edid_text_and_mfg(void)
     EXPECT(strcmp(e.manufacturer, "???") == 0, "invalid PNP letters");
 }
 
+static void test_bus_is_not_connector_index(void)
+{
+    int primary = -2, secondary = -2;
+
+    EXPECT_EQ_U(ddcci_i2c_number_in(
+                    "../../../../devices/pci0000:00/0000:03:00.0/i2c-3/i2c-8"),
+                8, "nested path uses the last i2c-N");
+    EXPECT_EQ_U(ddcci_i2c_number_in("../../card0/card0-DP-3/i2c-8"), 8,
+                "DP-3 in the path is not the bus");
+    EXPECT(ddcci_i2c_number_in("../../card0/card0-DP-3/ddc") < 0,
+           "connector index alone is not an i2c number");
+    EXPECT(ddcci_i2c_number_in("i2c-dev") < 0, "i2c-dev is not a bus");
+    EXPECT_EQ_U(ddcci_i2c_number_in("i2c-8"), 8, "plain adapter name");
+
+    ddcci_order_connector_buses("card0-DP-3",
+                                3, "AMDGPU DM i2c hw bus 2",
+                                8, "AMDGPU DM aux hw bus 2",
+                                &primary, &secondary);
+    EXPECT_EQ_U(primary, 8, "native DP tries the aux child first");
+    EXPECT_EQ_U(secondary, 3, "hw bus is only the fallback");
+
+    ddcci_order_connector_buses("DP-3", 3, "", 8, "", &primary, &secondary);
+    EXPECT_EQ_U(primary, 8, "DP-3 with no adapter names still prefers the child");
+    EXPECT_EQ_U(secondary, 3, "unnamed hw bus stays the fallback");
+
+    ddcci_order_connector_buses("card1-eDP-1",
+                                4, "AMDGPU DM i2c hw bus 0",
+                                7, "AMDGPU DM aux hw bus 0",
+                                &primary, &secondary);
+    EXPECT_EQ_U(primary, 7, "eDP prefers aux");
+
+    ddcci_order_connector_buses("card0-USB-C-1",
+                                2, "AMDGPU DM i2c hw bus 1",
+                                9, "AMDGPU DM aux hw bus 1",
+                                &primary, &secondary);
+    EXPECT_EQ_U(primary, 9, "USB-C prefers aux");
+
+    ddcci_order_connector_buses("card0-HDMI-A-1",
+                                5, "AMDGPU DM i2c hw bus 0",
+                                -1, NULL,
+                                &primary, &secondary);
+    EXPECT_EQ_U(primary, 5, "HDMI follows the ddc symlink");
+    EXPECT(secondary < 0, "HDMI with one adapter has no fallback");
+
+    ddcci_order_connector_buses("card0-HDMI-A-1",
+                                5, "AMDGPU DM i2c hw bus 0",
+                                9, "AMDGPU DM aux hw bus 0",
+                                &primary, &secondary);
+    EXPECT_EQ_U(primary, 5, "HDMI keeps the symlink when a child also exists");
+    EXPECT_EQ_U(secondary, 9, "HDMI child is only a fallback");
+
+    ddcci_order_connector_buses("card0-DP-1",
+                                8, "AMDGPU DM aux hw bus 1",
+                                8, "AMDGPU DM aux hw bus 1",
+                                &primary, &secondary);
+    EXPECT_EQ_U(primary, 8, "ddc symlink and child are the same adapter");
+    EXPECT(secondary < 0, "the same bus is not tried twice");
+
+    ddcci_order_connector_buses("card0-DP-1",
+                                6, "AMDGPU DM aux hw bus 0",
+                                7, "AMDGPU DM i2c hw bus 0",
+                                &primary, &secondary);
+    EXPECT_EQ_U(primary, 6, "an aux name on the symlink wins");
+    EXPECT_EQ_U(secondary, 7, "the non-aux adapter is the fallback");
+}
+
 int main(void)
 {
     test_strerror();
@@ -491,6 +557,7 @@ int main(void)
     test_caps_append_stops_at_nul();
     test_caps_case_and_probe_fields();
     test_edid_text_and_mfg();
+    test_bus_is_not_connector_index();
 
     printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed ? 1 : 0;

@@ -221,93 +221,113 @@ struct get_op {
     uint8_t op;
 };
 
-/* Connected DRM buses, without reading capabilities. Several outputs (a laptop
- * panel plus a monitor) are narrowed with one Get VCP each — eDP NACKs, a
- * DDC panel answers. Returns 0 and writes *bus_out, -1 if none, -2 if ambiguous. */
-static int sole_drm_bus(int *bus_out)
+/* Connected DRM connectors, not I2C bus numbers. "DP-3" is the third
+ * DisplayPort on the card; ddcci_open_connector picks the adapter that
+ * actually carries DDC/CI (the AUX child on AMD, not the ddc symlink).
+ * Several outputs are narrowed with one Get VCP each — eDP NACKs, a DDC
+ * panel answers. Returns 0 with *out open, 1 if an error was printed,
+ * -1 if DRM has nothing to open, -2 if ambiguous. */
+static int connected_connectors(char names[][256], int max, int *overflow)
 {
     DIR *dir;
     struct dirent *de;
-    int buses[8];
-    int nbus = 0;
-    int i, ddc_hits = 0, ddc_bus = -1;
+    int n = 0;
 
+    *overflow = 0;
     dir = opendir("/sys/class/drm");
     if (!dir)
-        return -1;
+        return 0;
 
-    while ((de = readdir(dir)) != NULL && nbus < 8) {
-        char base[512], path[576], status[32], link[512];
-        const char *p;
-        ssize_t n;
-        int bus;
+    while ((de = readdir(dir)) != NULL) {
+        char path[576], status[32];
+        FILE *f;
+        size_t r;
 
         if (de->d_name[0] == '.' || strchr(de->d_name, '-') == NULL)
             continue;
-        snprintf(base, sizeof(base), "/sys/class/drm/%s", de->d_name);
-        snprintf(path, sizeof(path), "%s/status", base);
-        {
-            FILE *f = fopen(path, "r");
-            size_t r;
-
-            if (!f)
-                continue;
-            r = fread(status, 1, sizeof(status) - 1, f);
-            fclose(f);
-            status[r] = '\0';
-            if (strncmp(status, "connected", 9) != 0)
-                continue;
-        }
-        snprintf(path, sizeof(path), "%s/ddc", base);
-        n = readlink(path, link, sizeof(link) - 1);
-        if (n <= 0 || (size_t)n >= sizeof(link) - 1)
+        snprintf(path, sizeof(path), "/sys/class/drm/%s/status", de->d_name);
+        f = fopen(path, "r");
+        if (!f)
             continue;
-        link[n] = '\0';
-        p = strstr(link, "i2c-");
-        if (!p || sscanf(p + 4, "%d", &bus) != 1 || bus < 0)
+        r = fread(status, 1, sizeof(status) - 1, f);
+        fclose(f);
+        status[r] = '\0';
+        if (strncmp(status, "connected", 9) != 0)
             continue;
-        for (i = 0; i < nbus; i++) {
-            if (buses[i] == bus)
-                break;
+        if (n == max) {
+            *overflow = 1;
+            break;
         }
-        if (i == nbus)
-            buses[nbus++] = bus;
+        snprintf(names[n], sizeof(names[n]), "%s", de->d_name);
+        n++;
     }
     closedir(dir);
+    return n;
+}
 
-    if (nbus == 0)
+static int open_sole_drm(ddcci_display **out)
+{
+    char names[16][256];
+    int overflow = 0;
+    int n, i, opened = 0, hits = 0, io_fail = 0;
+    ddcci_status_t io_st = DDCCI_OK;
+    const char *io_name = NULL;
+    ddcci_display *hit = NULL;
+
+    n = connected_connectors(names, 16, &overflow);
+    if (overflow)
+        return -2;
+    if (n == 0)
         return -1;
-    if (nbus == 1) {
-        *bus_out = buses[0];
-        return 0;
+    if (n == 1) {
+        ddcci_status_t st = ddcci_open_connector(names[0], out);
+
+        if (st == DDCCI_OK)
+            return 0;
+        if (st == DDCCI_ERR_NO_DEVICE)
+            return -1;
+        fprintf(stderr, "ddcci-probe: open %s: %s\n", names[0], ddcci_strerror(st));
+        return 1;
     }
 
-    {
-        int opened = 0;
+    for (i = 0; i < n; i++) {
+        ddcci_display *d = NULL;
+        ddcci_status_t st = ddcci_open_connector(names[i], &d);
 
-        for (i = 0; i < nbus; i++) {
-            ddcci_display *d = NULL;
-
-            if (ddcci_open(buses[i], &d) != DDCCI_OK)
-                continue;
-            opened++;
-            if (ddcci_has_ddc(d)) {
-                ddc_bus = buses[i];
-                ddc_hits++;
+        if (st == DDCCI_ERR_NO_DEVICE)
+            continue;
+        if (st != DDCCI_OK) {
+            if (!io_fail) {
+                io_fail = 1;
+                io_st = st;
+                io_name = names[i];
             }
+            continue;
+        }
+        opened++;
+        if (ddcci_has_ddc(d)) {
+            hits++;
+            if (hit)
+                ddcci_close(hit);
+            hit = d;
+        } else {
             ddcci_close(d);
         }
-        /* Every open failed (almost always permissions). Hand the first bus
-         * back so the caller reports that error instead of a vague "none". */
-        if (opened == 0) {
-            *bus_out = buses[0];
-            return 0;
-        }
     }
-    if (ddc_hits != 1)
-        return -2;
-    *bus_out = ddc_bus;
-    return 0;
+    if (hits == 1) {
+        *out = hit;
+        return 0;
+    }
+    if (hit)
+        ddcci_close(hit);
+    /* Every open failed (almost always permissions). Report that, not "none". */
+    if (opened == 0 && io_fail) {
+        fprintf(stderr, "ddcci-probe: open %s: %s\n", io_name, ddcci_strerror(io_st));
+        return 1;
+    }
+    if (opened == 0)
+        return -1;
+    return -2;
 }
 
 static int open_target(int bus, const char *connector, int explicit_target,
@@ -340,20 +360,16 @@ static int open_target(int bus, const char *connector, int explicit_target,
     if (explicit_target)
         return 2;
 
-    /* Prefer the single connected DRM bus. That is a sysfs walk, not a
-     * capabilities read. Fall back to a full scan only when DRM has no bus. */
+    /* Prefer the connected DRM connector. The library resolves the I2C
+     * adapter; the digits in "DP-3" are not a bus number. Fall back to a
+     * full scan only when DRM names no bus. */
     {
-        int drm = sole_drm_bus(&bus);
+        int drm = open_sole_drm(out);
 
-        if (drm == 0) {
-            st = ddcci_open(bus, out);
-            if (st != DDCCI_OK) {
-                fprintf(stderr, "ddcci-probe: open /dev/i2c-%d: %s\n",
-                        bus, ddcci_strerror(st));
-                return 1;
-            }
+        if (drm == 0)
             return 0;
-        }
+        if (drm == 1)
+            return 1;
         if (drm == -2) {
             fprintf(stderr,
                     "ddcci-probe: more than one connected output — pass --bus or --connector\n");

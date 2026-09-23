@@ -52,19 +52,23 @@ static ssize_t read_bin(const char *path, uint8_t *buf, size_t n)
     return (ssize_t)r;
 }
 
-static int parse_i2c_n(const char *s)
+int ddcci_i2c_number_in(const char *s)
 {
     const char *p;
     int bus = -1;
 
     if (!s)
         return -1;
-    p = strstr(s, "i2c-");
-    if (!p)
-        return -1;
-    p += 4;
-    if (sscanf(p, "%d", &bus) != 1 || bus < 0)
-        return -1;
+    /* The last i2c-<number> is the device. A parent adapter earlier in the
+     * path (…/i2c-3/i2c-8) is not the bus to open. "i2c-dev" has no number.
+     * "DP-3" has none either: that digit is a connector index. */
+    for (p = strstr(s, "i2c-"); p; p = strstr(p + 4, "i2c-")) {
+        int n;
+
+        if (sscanf(p + 4, "%d", &n) != 1 || n < 0)
+            continue;
+        bus = n;
+    }
     return bus;
 }
 
@@ -76,7 +80,7 @@ int ddcci_bus_from_devnode(const char *path)
         return -1;
     base = strrchr(path, '/');
     base = base ? base + 1 : path;
-    return parse_i2c_n(base);
+    return ddcci_i2c_number_in(base);
 }
 
 static void fill_adapter_name(int bus, char *dst, size_t n)
@@ -109,48 +113,193 @@ static void connector_short(const char *sysname, char *dst, size_t n)
     snprintf(dst, n, "%s", (dash && dash[1]) ? dash + 1 : (sysname ? sysname : ""));
 }
 
-static int bus_from_connector_sys(const char *base)
+static int name_prefers_aux(const char *s)
+{
+    if (!s || !s[0])
+        return 0;
+    /* DRM connector index, not an I2C adapter number. */
+    if (strncmp(s, "DP-", 3) == 0 || strncmp(s, "eDP-", 4) == 0)
+        return 1;
+    if (strncmp(s, "USB-", 4) == 0)
+        return 1;
+    return 0;
+}
+
+static int connector_prefers_aux(const char *sysname)
+{
+    char short_name[64];
+
+    if (name_prefers_aux(sysname))
+        return 1;
+    connector_short(sysname, short_name, sizeof(short_name));
+    return name_prefers_aux(short_name);
+}
+
+void ddcci_order_connector_buses(const char *connector,
+                                 int ddc_bus, const char *ddc_name,
+                                 int child_bus, const char *child_name,
+                                 int *primary, int *secondary)
+{
+    int ddc_aux, child_aux;
+
+    if (!primary || !secondary)
+        return;
+    *primary = -1;
+    *secondary = -1;
+    if (ddc_bus < 0)
+        ddc_bus = -1;
+    if (child_bus < 0)
+        child_bus = -1;
+    if (ddc_bus >= 0 && ddc_bus == child_bus)
+        child_bus = -1;
+
+    if (ddc_bus < 0 && child_bus < 0)
+        return;
+    if (ddc_bus < 0) {
+        *primary = child_bus;
+        return;
+    }
+    if (child_bus < 0) {
+        *primary = ddc_bus;
+        return;
+    }
+
+    ddc_aux = ddc_name && ddcci_ascii_icontains(ddc_name, "aux");
+    child_aux = child_name && ddcci_ascii_icontains(child_name, "aux");
+
+    if (connector_prefers_aux(connector)) {
+        /* Two different adapters. The one whose name contains "aux" is the
+         * DisplayPort AUX channel. With no names, the i2c-* child of the
+         * connector is that channel on amdgpu; the ddc symlink is the hw bus. */
+        if (ddc_aux && !child_aux) {
+            *primary = ddc_bus;
+            *secondary = child_bus;
+            return;
+        }
+        *primary = child_bus;
+        *secondary = ddc_bus;
+        return;
+    }
+
+    *primary = ddc_bus;
+    *secondary = child_bus;
+}
+
+/* ddc_bus: "ddc" symlink target. child_bus: i2c-* entry in the connector
+ * directory (the AUX adapter when it is not the symlink target). */
+static void buses_from_connector_sys(const char *base, int *ddc_bus, int *child_bus)
 {
     char path[512];
     char link[512];
     DIR *dir;
     struct dirent *de;
     ssize_t n;
-    int bus;
+
+    *ddc_bus = -1;
+    *child_bus = -1;
 
     snprintf(path, sizeof(path), "%s/ddc", base);
     n = readlink(path, link, sizeof(link) - 1);
     if (n > 0 && (size_t)n < sizeof(link) - 1) {
         link[n] = '\0';
-        bus = parse_i2c_n(link);
-        if (bus >= 0)
-            return bus;
+        *ddc_bus = ddcci_i2c_number_in(link);
     }
-
-    dir = opendir(path);
-    if (dir) {
-        while ((de = readdir(dir)) != NULL) {
-            if (strncmp(de->d_name, "i2c-", 4) == 0) {
-                bus = parse_i2c_n(de->d_name);
-                closedir(dir);
-                return bus;
+    if (*ddc_bus < 0) {
+        dir = opendir(path);
+        if (dir) {
+            while ((de = readdir(dir)) != NULL) {
+                if (strncmp(de->d_name, "i2c-", 4) != 0)
+                    continue;
+                *ddc_bus = ddcci_i2c_number_in(de->d_name);
+                if (*ddc_bus >= 0)
+                    break;
             }
+            closedir(dir);
         }
-        closedir(dir);
     }
 
     dir = opendir(base);
     if (!dir)
-        return -1;
+        return;
     while ((de = readdir(dir)) != NULL) {
-        if (strncmp(de->d_name, "i2c-", 4) == 0) {
-            bus = parse_i2c_n(de->d_name);
-            closedir(dir);
-            return bus;
-        }
+        int bus;
+
+        if (strncmp(de->d_name, "i2c-", 4) != 0)
+            continue;
+        bus = ddcci_i2c_number_in(de->d_name);
+        if (bus < 0)
+            continue;
+        if (*child_bus < 0 || (*child_bus == *ddc_bus && bus != *ddc_bus))
+            *child_bus = bus;
     }
     closedir(dir);
-    return -1;
+}
+
+static void connector_bus_candidates(const char *base, const char *sysname,
+                                     int *primary, int *secondary)
+{
+    int ddc_bus = -1, child_bus = -1;
+    char ddc_name[128];
+    char child_name[128];
+
+    buses_from_connector_sys(base, &ddc_bus, &child_bus);
+    fill_adapter_name(ddc_bus, ddc_name, sizeof(ddc_name));
+    fill_adapter_name(child_bus, child_name, sizeof(child_name));
+    ddcci_order_connector_buses(sysname, ddc_bus, ddc_name, child_bus, child_name,
+                                primary, secondary);
+}
+
+static int edid_on_bus_matches(int bus, const uint8_t *edid, size_t n)
+{
+    ddcci_display *d = NULL;
+    ddcci_edid got;
+
+    if (bus < 0 || !edid || n < DDCCI_EDID_LEN_MIN)
+        return 0;
+    if (ddcci_open(bus, &d) != DDCCI_OK)
+        return 0;
+    if (ddcci_read_edid_i2c(d, &got) != DDCCI_OK || got.len < DDCCI_EDID_LEN_MIN) {
+        ddcci_close(d);
+        return 0;
+    }
+    ddcci_close(d);
+    return memcmp(got.raw, edid, DDCCI_EDID_LEN_MIN) == 0;
+}
+
+static int bus_answers_ddc(int bus)
+{
+    ddcci_display *d = NULL;
+    int ok;
+
+    if (bus < 0 || ddcci_open(bus, &d) != DDCCI_OK)
+        return 0;
+    ok = ddcci_has_ddc(d) ? 1 : 0;
+    ddcci_close(d);
+    return ok;
+}
+
+/* primary was ordered first. When both exist, keep the one whose EDID matches
+ * the connector, else the one where slave 0x37 answers. Neither match: primary,
+ * so a panel with EDID but no DDC/CI (eDP) stays on the AUX adapter. */
+static int choose_connector_bus(int primary, int secondary,
+                                const uint8_t *sysfs_edid, size_t edid_n)
+{
+    if (primary < 0)
+        return secondary;
+    if (secondary < 0 || secondary == primary)
+        return primary;
+
+    if (sysfs_edid && edid_n >= DDCCI_EDID_LEN_MIN) {
+        if (edid_on_bus_matches(primary, sysfs_edid, edid_n))
+            return primary;
+        if (edid_on_bus_matches(secondary, sysfs_edid, edid_n))
+            return secondary;
+    }
+    if (bus_answers_ddc(primary))
+        return primary;
+    if (bus_answers_ddc(secondary))
+        return secondary;
+    return primary;
 }
 
 typedef struct {
@@ -185,7 +334,7 @@ static void note_i2c_children(const char *dirpath, bus_note *notes, int *nnotes,
 
         if (strncmp(de->d_name, "i2c-", 4) != 0)
             continue;
-        bus = parse_i2c_n(de->d_name);
+        bus = ddcci_i2c_number_in(de->d_name);
         /* "i2c-dev" is a directory, not an adapter number. */
         if (bus >= 0)
             note_bus(notes, nnotes, bus, connected);
@@ -323,11 +472,17 @@ int ddcci_bus_from_connector(const char *drm_connector, char *short_name, size_t
 {
     DIR *dir;
     struct dirent *de;
-    int best_bus = -1;
     int best_rank = 0;
+    int best_primary = -1;
+    int best_secondary = -1;
+    int best_connected = 0;
     char best_short[64];
+    char best_base[512];
+    uint8_t edid[DDCCI_EDID_LEN_MAX];
+    ssize_t edid_n;
 
     best_short[0] = '\0';
+    best_base[0] = '\0';
     if (short_name && short_n)
         short_name[0] = '\0';
     if (!drm_connector || !drm_connector[0])
@@ -342,7 +497,7 @@ int ddcci_bus_from_connector(const char *drm_connector, char *short_name, size_t
         char status[32];
         char path[540];
         int connected = 0;
-        int bus;
+        int primary = -1, secondary = -1;
         int rank;
 
         if (de->d_name[0] == '.' || strchr(de->d_name, '-') == NULL)
@@ -357,20 +512,39 @@ int ddcci_bus_from_connector(const char *drm_connector, char *short_name, size_t
             strcmp(status, "connected") == 0)
             connected = 1;
         rank = match_rank(de->d_name, drm_connector, connected);
-        bus = bus_from_connector_sys(base);
-        if (bus < 0)
+        connector_bus_candidates(base, de->d_name, &primary, &secondary);
+        if (primary < 0)
             continue;
         if (rank > best_rank) {
             best_rank = rank;
-            best_bus = bus;
+            best_primary = primary;
+            best_secondary = secondary;
+            best_connected = connected;
+            snprintf(best_base, sizeof(best_base), "%s", base);
             connector_short(de->d_name, best_short, sizeof(best_short));
         }
     }
     closedir(dir);
 
-    if (best_bus >= 0 && short_name && short_n)
+    if (best_primary < 0)
+        return -1;
+    if (short_name && short_n)
         snprintf(short_name, short_n, "%s", best_short);
-    return best_bus;
+    /* A disconnected port is not probed. Two adapters on a live port are:
+     * the ddc symlink alone is the wrong node for native DisplayPort. */
+    if (!best_connected || best_secondary < 0)
+        return best_primary;
+
+    {
+        char path[540];
+
+        snprintf(path, sizeof(path), "%s/edid", best_base);
+        edid_n = read_bin(path, edid, sizeof(edid));
+    }
+    if (edid_n < (ssize_t)DDCCI_EDID_LEN_MIN)
+        edid_n = 0;
+    return choose_connector_bus(best_primary, best_secondary,
+                                edid_n ? edid : NULL, (size_t)edid_n);
 }
 
 static void find_connector_for_bus(int bus, char *dst, size_t n)
@@ -391,14 +565,17 @@ static void find_connector_for_bus(int bus, char *dst, size_t n)
         char base[512];
         char path[540];
         char status[32];
-        int b;
 
         if (de->d_name[0] == '.' || strchr(de->d_name, '-') == NULL)
             continue;
         snprintf(base, sizeof(base), "/sys/class/drm/%s", de->d_name);
-        b = bus_from_connector_sys(base);
-        if (b != bus)
-            continue;
+        {
+            int ddc_bus = -1, child_bus = -1;
+
+            buses_from_connector_sys(base, &ddc_bus, &child_bus);
+            if (ddc_bus != bus && child_bus != bus)
+                continue;
+        }
         connector_short(de->d_name, fallback, sizeof(fallback));
         snprintf(path, sizeof(path), "%s/status", base);
         if (read_text(path, status, sizeof(status)) > 0 &&
@@ -441,7 +618,7 @@ static ddcci_status_t scan_drm(info_vec *v, bus_note *notes, int *nnotes)
         char status[32];
         ddcci_info info;
         uint8_t edid[DDCCI_EDID_LEN_MAX];
-        ssize_t n;
+        ssize_t n = -1;
         int connected;
 
         if (de->d_name[0] == '.' || strchr(de->d_name, '-') == NULL)
@@ -454,22 +631,33 @@ static ddcci_status_t scan_drm(info_vec *v, bus_note *notes, int *nnotes)
         connected = strcmp(status, "connected") == 0;
 
         ddcci_info_reset(&info);
-        info.bus = bus_from_connector_sys(base);
-        /* The ddc symlink is the adapter the kernel wants us to use. A
-         * connector also has an aux i2c-* child on AMD; that node is the
-         * same port and must not be probed again in the fallback scan. */
-        note_bus(notes, nnotes, info.bus, connected);
-        note_i2c_children(base, notes, nnotes, connected);
-        if (!connected)
-            continue;
+        {
+            int primary = -1, secondary = -1;
+
+            /* primary is the first adapter to try, not "whatever the ddc
+             * symlink says". On AMD DisplayPort that symlink is the non-AUX
+             * hw bus (often numbered like the connector) and does not carry
+             * DDC/CI. The i2c-* child is the AUX adapter that does.
+             * Both are noted so the fallback scan does not open the loser. */
+            connector_bus_candidates(base, de->d_name, &primary, &secondary);
+            note_bus(notes, nnotes, primary, connected);
+            note_bus(notes, nnotes, secondary, connected);
+            note_i2c_children(base, notes, nnotes, connected);
+            if (!connected)
+                continue;
+
+            snprintf(path, sizeof(path), "%s/edid", base);
+            n = read_bin(path, edid, sizeof(edid));
+            info.bus = choose_connector_bus(primary, secondary,
+                                            n >= (ssize_t)DDCCI_EDID_LEN_MIN ? edid : NULL,
+                                            n > 0 ? (size_t)n : 0);
+        }
 
         connector_short(de->d_name, info.connector, sizeof(info.connector));
         if (info.bus >= 0)
             snprintf(info.path, sizeof(info.path), "/dev/i2c-%d", info.bus);
         fill_adapter_name(info.bus, info.adapter_name, sizeof(info.adapter_name));
 
-        snprintf(path, sizeof(path), "%s/edid", base);
-        n = read_bin(path, edid, sizeof(edid));
         if (n >= (ssize_t)DDCCI_EDID_LEN_MIN &&
             ddcci_parse_edid(edid, (size_t)n, &info.edid) == DDCCI_OK)
             info.edid_ok = true;
@@ -520,7 +708,7 @@ static ddcci_status_t scan_i2c_fallback(info_vec *v, const bus_note *notes, int 
 
         if (strncmp(de->d_name, "i2c-", 4) != 0)
             continue;
-        bus = parse_i2c_n(de->d_name);
+        bus = ddcci_i2c_number_in(de->d_name);
         if (bus < 0)
             continue;
         /* DRM already owns this adapter. Disconnected ports are not probed;

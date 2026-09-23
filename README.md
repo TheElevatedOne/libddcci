@@ -252,14 +252,20 @@ I2C map on the DDC link: `0x50` EDID EEPROM, `0x37` DDC/CI.
 
 ## Discovery
 
-1. Walk `/sys/class/drm/card*-*` and remember every connector's I2C bus.
-2. For `status=connected`, read EDID from sysfs and follow the `ddc` symlink
-   (or an `i2c-*` child, on kernels that expose it that way) to `/dev/i2c-N`.
-3. Open that node, probe DDC/CI, and read capabilities.
-4. Adapters DRM does not reference are scanned too. Skipped without an open:
+1. Walk `/sys/class/drm/card*-*` and remember every connector's I2C adapters.
+2. For `status=connected`, read EDID from sysfs. The bus is not the connector
+   index: `DP-3` is the third DisplayPort on the card, not `/dev/i2c-3`.
+3. A connector can name two adapters. The `ddc` symlink is one; an `i2c-*`
+   entry in the connector directory is the other. On AMD the symlink points
+   at the non-AUX "hw" bus, which does not speak DDC/CI for a native
+   DisplayPort link. The directory entry (`AMDGPU DM aux hw bus`) does.
+   DisplayPort, eDP, and USB-C try the AUX adapter first and keep it when
+   its EDID matches sysfs, or when slave `0x37` answers there. HDMI, DVI,
+   and VGA keep the symlink. The adapter that loses is not opened again.
+4. Open the chosen node, probe DDC/CI, and read capabilities.
+5. Adapters DRM does not reference are scanned too. Skipped without an open:
    SMBus (motherboard sensors), AMD "i2c bit bus OEM" adapters, disconnected
-   DRM ports, and the aux `i2c-*` child of a connector whose `ddc` symlink
-   already names the bus to use.
+   DRM ports, and the adapter a connector already named but did not select.
 
 `ddcci_open_connector("DP-1")` or `"card0-HDMI-A-1"` resolves the bus from
 sysfs and opens it. It does not probe the other connectors. A short name that
