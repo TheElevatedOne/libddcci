@@ -1,6 +1,6 @@
 # libddcci
 
-![Static Badge](https://img.shields.io/badge/Vibecoded-Grok-black?style=for-the-badge&labelColor=%236F0E82)
+![Static Badge](https://img.shields.io/badge/Vibecoded-Grok-black?style=for-the-badge&labelColor=%236F0E82) ![AUR Version](https://img.shields.io/aur/version/libddcci-git?style=for-the-badge&logo=archlinux)
 
 A small C library for **DDC/CI** (VESA MCCS) on Linux. It talks to a monitor's
 I2C slave `0x37` through `/dev/i2c-*`: discover displays, test whether DDC/CI
